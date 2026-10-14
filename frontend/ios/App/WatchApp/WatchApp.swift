@@ -37,6 +37,7 @@ struct WatchSet: Identifiable {
     let reps: Int
     let seconds: Int?
     let sides: [String: [String: Any]]?
+    var warmup = false
     var id: Int { number }
 }
 
@@ -46,6 +47,8 @@ struct WatchEdit: Identifiable {
     let field: String
     let side: String?
     let value: Double
+    var step = 2.5
+    var owned: [Double] = []
     var id: String { "\(entry):\(set):\(field):\(side ?? "both")" }
 }
 
@@ -53,6 +56,8 @@ struct WatchEntry: Identifiable {
     let index: Int
     let name: String
     let thumbnailKey: String?
+    var weightStep = 2.5
+    var owned: [Double] = []
     let sets: [WatchSet]
     var id: Int { index }
 }
@@ -152,12 +157,15 @@ final class WatchModel: NSObject, ObservableObject, WCSessionDelegate {
         entries = ((value?["entries"] as? [[String: Any]]) ?? []).enumerated().map { index, row in
             WatchEntry(index: index, name: row["name"] as? String ?? watchText("Exercise"),
                        thumbnailKey: row["thumbnailKey"] as? String,
+                       weightStep: (row["weightStep"] as? NSNumber)?.doubleValue ?? (unit == "lb" ? 5 : 2.5),
+                       owned: (row["owned"] as? [NSNumber])?.map(\.doubleValue) ?? [],
                        sets: ((row["sets"] as? [[String: Any]]) ?? []).enumerated().map { number, item in
                 return WatchSet(number: number, done: item["done"] as? Bool ?? false,
                                 weight: (item["w"] as? NSNumber)?.doubleValue ?? 0,
                                 reps: (item["r"] as? NSNumber)?.intValue ?? 0,
                                 seconds: (item["sec"] as? NSNumber)?.intValue,
-                                sides: item["sides"] as? [String: [String: Any]])
+                                sides: item["sides"] as? [String: [String: Any]],
+                                warmup: Self.isWarmup(item))
             })
         }
         if sessionId != previousId {
@@ -174,6 +182,61 @@ final class WatchModel: NSObject, ObservableObject, WCSessionDelegate {
                 ?? entries.first(where: { $0.sets.contains { !$0.done } })?.index
             focusRevision = UUID()
         }
+    }
+
+    private static func isWarmup(_ row: [String: Any]) -> Bool {
+        (row["phase"] as? String) == "warmup" || (row["warmup"] as? Bool) == true
+    }
+
+    // "Add set" / "Add warm-up": the phone hands each exercise the next few rows it would build
+    // (`additions`, lib/add-rows.js), so the Watch adds the same row offline and sends it back.
+    func addSet(entry: Int) { addRow(entry: entry, warmup: false) }
+    func addWarmup(entry: Int) { addRow(entry: entry, warmup: true) }
+
+    func canAddWarmup(entry: Int) -> Bool {
+        guard let rows = localSession?["entries"] as? [[String: Any]], rows.indices.contains(entry) else { return false }
+        return !((rows[entry]["additions"] as? [String: Any])?["warmups"] as? [Any] ?? []).isEmpty
+    }
+
+    private func addRow(entry: Int, warmup: Bool) {
+        guard var current = localSession, !finished,
+              var rows = current["entries"] as? [[String: Any]], rows.indices.contains(entry) else { return }
+        var row = rows[entry]
+        var sets = row["sets"] as? [[String: Any]] ?? []
+        var additions = row["additions"] as? [String: Any] ?? [:]
+        let key = warmup ? "warmups" : "sets"
+        var queue = additions[key] as? [Any] ?? []
+        var added: [[String: Any]] = []
+        if !queue.isEmpty {
+            let next = queue.removeFirst()
+            added = warmup ? ((next as? [String: Any]).map { [$0] } ?? []) : (next as? [[String: Any]] ?? [])
+        } else if !warmup, var copy = sets.last, copy["sides"] == nil, copy["side"] == nil {
+            copy["done"] = false
+            added = [copy]
+        }
+        guard !added.isEmpty else { return }
+        added = added.map { var item = $0; item["done"] = false; return item }
+        if warmup {
+            sets.insert(contentsOf: added, at: sets.firstIndex(where: { !Self.isWarmup($0) }) ?? sets.count)
+        } else {
+            sets.append(contentsOf: added)
+        }
+        additions[key] = queue
+        row["sets"] = sets
+        row["additions"] = additions
+        rows[entry] = row
+        current["entries"] = rows
+        let seq = (current["seq"] as? Int ?? 0) + 1
+        current["seq"] = seq
+        var change: [String: Any] = ["seq": seq, "entry": entry, "field": warmup ? "addWarmup" : "addSet"]
+        if warmup { change["row"] = added[0] } else { change["rows"] = added }
+        var changes = current["changes"] as? [[String: Any]] ?? []
+        changes.append(change)
+        current["changes"] = changes
+        localSession = current
+        watchOwned = true
+        saveLocal()
+        sendLocal()
     }
 
     private func saveLocal() {
@@ -873,7 +936,7 @@ struct WatchExerciseCard: View {
                     Button { model.toggleSet(entry: entry.index, set: set.number) } label: {
                         HStack(spacing: 3) {
                             Image(systemName: set.done ? "checkmark.circle.fill" : "circle").font(.system(size: 20))
-                            Text("\(set.number + 1)").font(.system(size: 10, weight: .semibold))
+                            Text(set.warmup ? "W" : "\(set.number + 1)").font(.system(size: 10, weight: .semibold))
                         }
                         .foregroundStyle(set.done ? .green : .secondary)
                         .frame(width: 38, height: 44)
@@ -899,6 +962,20 @@ struct WatchExerciseCard: View {
                 .padding(.horizontal, 2)
                 .background(set.done ? Color.green.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 9))
             }
+        if !model.finished {
+            HStack(spacing: 6) {
+                Button { model.addWarmup(entry: entry.index) } label: {
+                    Label(watchText("Warm-up"), systemImage: "plus").font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                }
+                .disabled(!model.canAddWarmup(entry: entry.index))
+                Button { model.addSet(entry: entry.index) } label: {
+                    Label(watchText("Set"), systemImage: "plus").font(.system(size: 12, weight: .semibold))
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                }
+            }
+            .buttonStyle(.bordered)
+        }
         }
         .padding(8)
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
@@ -909,7 +986,8 @@ struct WatchExerciseCard: View {
         let formatted = field == "w" ? value.formatted(.number.precision(.fractionLength(0...2))) : "\(Int(value))"
         let unit = field == "w" ? model.unit : field == "sec" ? "s" : "rep"
         return Button {
-            onEdit(WatchEdit(entry: entry.index, set: set.number, field: field, side: side, value: value))
+            onEdit(WatchEdit(entry: entry.index, set: set.number, field: field, side: side, value: value,
+                             step: entry.weightStep, owned: entry.owned))
         } label: {
             HStack(spacing: 2) {
                 Text(formatted).font(.system(size: 18, weight: .semibold, design: .rounded).monospacedDigit())
@@ -941,12 +1019,30 @@ struct WatchNumberEditor: View {
         VStack(spacing: 12) {
             Text(edit.field == "w" ? watchText("Weight") : edit.field == "sec" ? watchText("Seconds") : watchText("Repetitions"))
                 .font(.headline)
-            Stepper(value: $value, in: 0...500, step: edit.field == "w" ? 0.25 : 1) {
-                Text(edit.field == "w" ? String(format: "%.2f", value) : "\(Int(value))")
+            Stepper(onIncrement: { move(1) }, onDecrement: { move(-1) }) {
+                Text(edit.field == "w" ? value.formatted(.number.precision(.fractionLength(0...2))) : "\(Int(value))")
                     .font(.title2.monospacedDigit())
             }
             Button(watchText("Save")) { onSave(value); dismiss() }
         }.padding(.horizontal, 4)
+    }
+
+    // The same + / − as the Workout screen (lib/progression.js addStep, lib/dumbbells.js
+    // stepOwned): bell to bell when the dumbbells you own are listed, else one load step —
+    // snapped to the step's grid from a weight on it, plainly added from one off it.
+    private func move(_ direction: Double) {
+        guard edit.field == "w" else { value = min(500, max(0, value + direction)); return }
+        let eps = 1e-6
+        if !edit.owned.isEmpty {
+            let next = direction > 0 ? edit.owned.first { $0 > value + eps } : edit.owned.last { $0 < value - eps }
+            value = next ?? value
+            return
+        }
+        let step = edit.step
+        let round1 = { (v: Double) in (v * 10).rounded() / 10 }
+        let onGrid = step > 0 && abs(value - (value / step).rounded() * step) <= 0.1
+        let next = value + direction * step
+        value = min(500, max(0, onGrid ? round1((next / step).rounded() * step) : round1(next)))
     }
 }
 
