@@ -4,6 +4,7 @@ import { exerciseNameText } from './i18n-core.js'
 import { exOr } from './exercises.js'
 import { bestWeightForEntry } from './history.js'
 import { isSideSet, syncSideAggregate } from './workout-model.js'
+import { additionsFor, applyAddition, weightStepFor } from './add-rows.js'
 import { buildCombinedEntries } from './session-merge.js'
 import { nav } from './nav.js'
 import { useUI } from '../store/useUI.js'
@@ -44,6 +45,8 @@ export function snapshot(store) {
       ...entry, name: exerciseNameText(exOr(entry.id)),
       thumbnailKey: watchThumbnailFor(exOr(entry.id))?.key,
       restSec: entry.target?.restSec ?? S.restSec,
+      additions: additionsFor(S, entry),
+      ...weightStepFor(S, entry),
     })) }) : {},
     routines: (S.routines || []).filter(r => r.ex?.length).map(r => ({
       id: String(r.id), name: r.name,
@@ -51,6 +54,8 @@ export function snapshot(store) {
         ...entry, name: exerciseNameText(exOr(entry.id)),
         thumbnailKey: watchThumbnailFor(exOr(entry.id))?.key,
         restSec: r.ex[index]?.restSec ?? S.restSec,
+        additions: additionsFor(S, entry),
+        ...weightStepFor(S, entry),
       }))),
     })),
     completedIds: (S.workouts || []).slice(-20).map(w => String(w.id)),
@@ -96,7 +101,7 @@ export async function applyWatchSession(store, command) {
       s.active = {
         id: incoming.id, d: incoming.d, start: incoming.start,
         routineIds: incoming.routineIds, name: incoming.name,
-        bw: null, cur: 0, entries: incoming.entries.map(({ name, restSec, thumbnailKey, ...entry }) => entry),
+        bw: null, cur: 0, entries: incoming.entries.map(({ name, restSec, thumbnailKey, additions, weightStep, owned, ...entry }) => entry),
         workoutView: s.workoutView || 'cards', _watchSeq: seq,
       }
     })
@@ -112,6 +117,13 @@ export async function applyWatchSession(store, command) {
       for (const change of (incoming.changes || []).filter(c => c.seq > previousSeq).sort((a, b) => a.seq - b.seq)) {
         if (change.field === 'rest') {
           if (Date.now() - Number(change.at) < 30000) restActions.push(change.value)
+          continue
+        }
+        if (change.field === 'addSet' || change.field === 'addWarmup') {
+          const target = active.entries?.[change.entry]
+          if (!target || String(target.id) !== String(incoming.entries?.[change.entry]?.id)) continue
+          const next = applyAddition(target.sets || [], change)
+          if (next) { target.sets = next; target.topW = bestWeightForEntry(target) || null }
           continue
         }
         if (!['done', 'w', 'r', 'sec'].includes(change.field)) continue
